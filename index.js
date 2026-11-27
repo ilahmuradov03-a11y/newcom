@@ -1,4 +1,4 @@
-// index.js - RENDER ÜÇÜN TAM OPTİMİZƏ EDİLMİŞ SÜRƏTLİ VERSİYA (v2)
+// index.js - RENDER ÜÇÜN TAM OPTİMİZƏ EDİLMİŞ SÜRƏTLİ VERSİYA (v2.1 - lag/menyu/bildiriş düzəlişləri)
 const TelegramBot = require('node-telegram-bot-api');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
@@ -7,6 +7,7 @@ const { NewMessage } = require('telegram/events');
 const fetch = require('node-fetch');
 const http = require('http');
 const bigInt = require('big-integer');
+const https = require('https');
 
 process.on('uncaughtException', (err) => console.error('Kritik Xəta:', err.message));
 process.on('unhandledRejection', (r) => console.error('Tutulmayan Xəta:', r));
@@ -30,25 +31,39 @@ const DEFAULT_TOURS_BEFORE_PAUSE = 5;
 const DEFAULT_PAUSE_MINUTES = 30;
 const DEFAULT_AUTOREPLY_COOLDOWN_DAYS = 4;
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// Daha sürətli polling: qısa interval, uzun-poll, keep-alive və IPv4 (Render-də gecikməni azaldır)
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: { interval: 100, autoStart: true, params: { timeout: 25 } },
+  request: { agentOptions: { keepAlive: true, family: 4 } }
+});
 bot.on('polling_error', (error) => console.log('Polling xətası:', error.message));
 
 // ============ DATABASE ============
+// Bütün sorğulara timeout + keep-alive əlavə edilib: asılı qalan Firebase sorğusu artıq bütün döngünü dondurmur.
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 30 });
+const DB_TIMEOUT_MS = 15000;
 async function getDB(path) {
-  try {
-    const r = await fetch(`${FIREBASE_URL}/${path}.json`);
-    const j = await r.json();
-    if (j && typeof j === 'object' && !Array.isArray(j) && typeof j.error === 'string') {
-      console.error(`DB oxuma xətası [${path}]: ${j.error}`);
-      return null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(`${FIREBASE_URL}/${path}.json`, { agent: httpsAgent, timeout: DB_TIMEOUT_MS });
+      const j = await r.json();
+      if (j && typeof j === 'object' && !Array.isArray(j) && typeof j.error === 'string') {
+        console.error(`DB oxuma xətası [${path}]: ${j.error}`);
+        return null;
+      }
+      return j;
+    } catch (e) {
+      if (attempt === 1) return null;
+      await new Promise(res => setTimeout(res, 300));
     }
-    return j;
-  } catch (e) { return null; }
+  }
+  return null;
 }
 async function setDB(path, data) {
   try {
     const r = await fetch(`${FIREBASE_URL}/${path}.json`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+      agent: httpsAgent, timeout: DB_TIMEOUT_MS
     });
     if (!r.ok) console.error(`DB yazma xətası [${path}]: HTTP ${r.status}`);
   } catch (e) { console.error("DB xətası:", e.message); }
@@ -56,7 +71,8 @@ async function setDB(path, data) {
 async function updateDB(path, partial) {
   try {
     const r = await fetch(`${FIREBASE_URL}/${path}.json`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(partial)
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(partial),
+      agent: httpsAgent, timeout: DB_TIMEOUT_MS
     });
     if (!r.ok) console.error(`DB update xətası [${path}]: HTTP ${r.status}`);
   } catch (e) { console.error("DB update xətası:", e.message); }
@@ -404,6 +420,80 @@ if (!global.pauseNotified) global.pauseNotified = {};
 if (!global.autoReplyClients) global.autoReplyClients = {};
 if (!global.autoReplyStarting) global.autoReplyStarting = new Set();
 if (!global.notifiedLicenseThresholds) global.notifiedLicenseThresholds = {};
+if (!global.localNextRun) global.localNextRun = {};
+if (!global.entityCache) global.entityCache = {};
+if (!global.langCache) global.langCache = {};
+if (!global.profileSavedAt) global.profileSavedAt = {};
+if (!global.usersSnap) global.usersSnap = { at: 0, data: null };
+if (!global.licAll) global.licAll = { at: 0, data: null, p: null };
+
+// ---- Keşlər (Firebase-ə lazımsız sorğuları kəsir -> bot cavabı sürətlənir) ----
+function cachedLang(chatId) { const c = global.langCache[chatId]; return (c && c.v) || 'az'; }
+function setLangCache(chatId, l) { global.langCache[chatId] = { v: l, at: Date.now() }; }
+async function getLang(chatId) {
+  const c = global.langCache[chatId];
+  if (c && Date.now() - c.at < 10 * 60 * 1000) return c.v;
+  const l = await getDB(`users/${chatId}/lang`);
+  const v = (typeof l === 'string' && langData[l]) ? l : 'az';
+  setLangCache(chatId, v);
+  return v;
+}
+async function getUserFields(chatId, fields) {
+  const vals = await Promise.all(fields.map(f => getDB(`users/${chatId}/${f}`)));
+  const o = {};
+  fields.forEach((f, i) => { o[f] = vals[i]; });
+  return o;
+}
+// Bütün lisenziyalar 30 saniyəlik keşdə (əvvəl hər istifadəçi üçün ayrıca sorğu gedirdi)
+async function getLicensesCached() {
+  const c = global.licAll;
+  if (c.data && Date.now() - c.at < 30000) return c.data;
+  if (c.p) return c.p;
+  c.p = (async () => {
+    const d = await getDB('licenses');
+    if (d) { c.data = d; c.at = Date.now(); }
+    return c.data;
+  })().finally(() => { c.p = null; });
+  return c.p;
+}
+async function getLicense(code) {
+  if (!code) return null;
+  const all = await getLicensesCached();
+  if (all && all[code]) return all[code];
+  return getDB(`licenses/${code}`);
+}
+// İstifadəçi bazasının ortaq şəkli (tick hər 5 san yeniləyir; digər işlər bundan oxuyur)
+async function getUsersSnap(maxAgeMs) {
+  const c = global.usersSnap;
+  if (c.data && Date.now() - c.at < maxAgeMs) return c.data;
+  const u = await getDB('users');
+  if (u) global.usersSnap = { at: Date.now(), data: u };
+  return u || c.data;
+}
+function needsStop(user) {
+  if (!user) return false;
+  if (user.fullBotActive || user.autoReplyEnabled) return true;
+  return Object.values(user.accounts || {}).some(a => a && a.status === 'ACTIVE');
+}
+function cleanupSession(chatId) {
+  const s = userSessions[chatId];
+  delete userSessions[chatId];
+  if (s && s.client) { try { s.client.disconnect().catch(() => {}); } catch (e) {} }
+}
+// Avtocavab cooldown-ları users/ içindən çıxarılıb (users obyektini şişirib hər oxumanı yavaşladırdı)
+(async function migrateCooldowns() {
+  try {
+    const users = await getDB('users');
+    if (!users) return;
+    for (const chatId in users) {
+      const cds = users[chatId] && users[chatId].autoReplyCooldowns;
+      if (cds && typeof cds === 'object') {
+        await updateDB(`autoReplyCooldowns/${chatId}`, cds);
+        await setDB(`users/${chatId}/autoReplyCooldowns`, null);
+      }
+    }
+  } catch (e) { console.error('migrateCooldowns:', e.message); }
+})();
 
 function accTaskKey(chatId, phone) { return `${chatId}_${phone}`; }
 function requestAbort(chatId, phone) { global.abortFlags[accTaskKey(chatId, phone)] = true; }
@@ -505,7 +595,7 @@ async function stopAllAccountsForLicense(chatId, user) {
 }
 
 async function expireAndNotify(chatId, user) {
-  await stopAllAccountsForLicense(chatId, user);
+  if (needsStop(user)) await stopAllAccountsForLicense(chatId, user);
   if (global.expiredNotified[chatId]) return;
   global.expiredNotified[chatId] = true;
   const lang = user?.lang || 'az';
@@ -522,7 +612,7 @@ async function expireAndNotify(chatId, user) {
 }
 
 async function frozenAndNotify(chatId, user) {
-  await stopAllAccountsForLicense(chatId, user);
+  if (needsStop(user)) await stopAllAccountsForLicense(chatId, user);
   if (global.frozenNotified[chatId]) return;
   global.frozenNotified[chatId] = true;
   const lang = user?.lang || 'az';
@@ -536,7 +626,10 @@ async function frozenAndNotify(chatId, user) {
 }
 
 // ============ STATİSTİKA ============
-async function trackSend(chatId, phone, contentType, success) {
+function trackSend(chatId, phone, contentType, success) {
+  return withLock(`stats_${chatId}_${phone}`, () => _trackSend(chatId, phone, contentType, success)).catch(() => {});
+}
+async function _trackSend(chatId, phone, contentType, success) {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const dbPath = `stats/${chatId}/${phone}`;
@@ -703,15 +796,59 @@ async function fetchSourceMessages(client, sourceEntity) {
   } catch (e) { return []; }
 }
 
-async function sendOrUpdate(chatId, text, options = {}) {
-  try {
-    if (mainMsgIds[chatId]) {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: mainMsgIds[chatId], ...options });
+// Menyu mesajı: HƏMİŞƏ eyni mesaj redaktə olunur (yeni mesaj yığılmır).
+//  - "message is not modified" olduqda yeni mesaj göndərilmir
+//  - redaktə mümkün olmasa yeni mesaj göndərilir və köhnə menyu silinir
+//  - hər çat üçün əməliyyatlar növbəyə düzülür (sürətli basanda iki mesaj yaranmır)
+//  - noBack:true olmayan hər menyuya avtomatik "Ana Menyu" düyməsi əlavə olunur
+const chatQueues = {};
+function sendOrUpdate(chatId, text, options = {}) {
+  const prev = chatQueues[chatId] || Promise.resolve();
+  const run = prev.catch(() => {}).then(() => _sendOrUpdate(chatId, text, options));
+  chatQueues[chatId] = run.catch(() => {});
+  return run;
+}
+function addBackRow(chatId, opts) {
+  const lang = cachedLang(chatId);
+  const backRow = [{ text: t('back_main', lang), callback_data: 'back_to_main' }];
+  const kb = opts.reply_markup && opts.reply_markup.inline_keyboard;
+  if (!Array.isArray(kb)) { opts.reply_markup = { inline_keyboard: [backRow] }; return; }
+  const has = kb.some(row => row.some(btn => btn.callback_data === 'back_to_main' || btn.callback_data === 'cancel_operation'));
+  if (has) return;
+  opts.reply_markup = { ...opts.reply_markup, inline_keyboard: [...kb, backRow] };
+}
+function tgErr(e) { return String((e && e.response && e.response.body && e.response.body.description) || (e && e.message) || ''); }
+async function _sendOrUpdate(chatId, text, options) {
+  const { noBack, ...opts } = options;
+  if (!noBack) addBackRow(chatId, opts);
+  const msgId = mainMsgIds[chatId];
+  if (msgId) {
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, ...opts });
       return;
+    } catch (e) {
+      const d = tgErr(e);
+      if (/message is not modified/i.test(d)) return;
+      if (/can't parse entities/i.test(d) && opts.parse_mode) {
+        try {
+          const o2 = { ...opts }; delete o2.parse_mode;
+          await bot.editMessageText(String(text).replace(/[_*`\[\]]/g, ''), { chat_id: chatId, message_id: msgId, ...o2 });
+          return;
+        } catch (e2) { /* aşağıda yeni mesaj */ }
+      }
     }
-  } catch (e) {}
-  const sent = await bot.sendMessage(chatId, text, options);
+  }
+  let sent;
+  try { sent = await bot.sendMessage(chatId, text, opts); }
+  catch (e) {
+    if (/can't parse entities/i.test(tgErr(e)) && opts.parse_mode) {
+      const o2 = { ...opts }; delete o2.parse_mode;
+      sent = await bot.sendMessage(chatId, String(text).replace(/[_*`\[\]]/g, ''), o2);
+    } else throw e;
+  }
+  const oldId = mainMsgIds[chatId];
   mainMsgIds[chatId] = sent.message_id;
+  if (oldId && oldId !== sent.message_id) bot.deleteMessage(chatId, oldId).catch(() => {});
 }
 
 // ============ ORTAQ CLIENT MENECERİ ============
@@ -780,7 +917,7 @@ async function getAutoReplyConfig(chatId) {
   if (enabled && message) {
     let ok = true;
     if (activeLicense) {
-      const lic = await getDB(`licenses/${activeLicense}`);
+      const lic = await getLicense(activeLicense);
       if (lic && !isLicenseCurrentlyValid(lic)) ok = false;
     }
     if (ok) {
@@ -812,13 +949,16 @@ async function tryAutoReply(e, chatId, phone, key, { senderId, peer, via }) {
     if (!cfg) { d.lastSkip = 'avtocavab söndürülüb / mətn yoxdur / lisenziya bitib'; return; }
 
     let lastAt = global.autoReplyLast[lastKey] || 0;
-    if (!lastAt) lastAt = (await getDB(`users/${chatId}/autoReplyCooldowns/${memKey}`)) || 0;
+    if (!lastAt) {
+      lastAt = (await getDB(`autoReplyCooldowns/${chatId}/${memKey}`)) || 0;
+      if (lastAt) global.autoReplyLast[lastKey] = lastAt;
+    }
     if (lastAt && Date.now() - lastAt < cfg.cooldownMs) { d.lastSkip = `cooldown (${senderId})`; return; }
 
     global.autoReplyLast[lastKey] = Date.now(); marked = true;
     await new Promise(res => setTimeout(res, 300 + Math.random() * 600));
     await e.client.sendMessage(peer, { message: cfg.message, formattingEntities: cfg.entities });
-    await setDB(`users/${chatId}/autoReplyCooldowns/${memKey}`, Date.now());
+    await setDB(`autoReplyCooldowns/${chatId}/${memKey}`, Date.now());
     d.replies++; d.lastReplyAt = Date.now(); d.lastSkip = '';
     marked = false;
     console.log(`AutoReply ✓ ${key} → ${senderId} (${via})`);
@@ -914,21 +1054,22 @@ setInterval(async () => {
   for (const key of Object.keys(global.clients)) {
     const e = global.clients[key];
     if (!e || !e.autoReply || !e.chatId) continue;
+    if (global.runningAccounts.has(key)) continue; // göndərmə zamanı poll yükü yaratmasın
     try { await pollAutoReply(key, e); } catch (err) { arDiag(key).lastError = 'poll: ' + err.message; }
   }
-}, 20000);
+}, 45000);
 
 // Sinxronizasiya: avtocavab aktivdirsə client həmişə açıq olmalıdır
 setInterval(async () => {
   try {
-    const users = await getDB('users');
+    const users = await getUsersSnap(20000);
     if (!users) return;
     for (const chatId in users) {
       const user = users[chatId];
-      if (!user.accounts) continue;
+      if (!user || !user.accounts) continue;
       let licenseOk = true;
       if (user.activeLicense) {
-        const lic = await getDB(`licenses/${user.activeLicense}`);
+        const lic = await getLicense(user.activeLicense);
         licenseOk = isLicenseCurrentlyValid(lic);
       }
       for (const phone in user.accounts) {
@@ -997,8 +1138,10 @@ setInterval(async () => {
 
 // ============ MAIN MENU ============
 async function showMainMenu(chatId) {
-  const user = await getDB(`users/${chatId}`);
-  const lang = user?.lang || 'az';
+  const [lang, activeLicense, fullBotActive] = await Promise.all([
+    getLang(chatId), getDB(`users/${chatId}/activeLicense`), getDB(`users/${chatId}/fullBotActive`)
+  ]);
+  const user = { activeLicense, fullBotActive };
   let licActive = false, licExpText = "", isFrozen = false;
 
   if (user?.activeLicense) {
@@ -1057,8 +1200,7 @@ async function showMainMenu(chatId) {
     keyboard.push([{ text: '💬 WhatsApp Dəstək', url: 'https://wa.me/19048477074' }]);
     keyboard.push([{ text: '📩 Dəstək (Telegram)', url: SUPPORT_URL }]);
   }
-  const settingsForUrl = await getDB('settings') || {};
-  const allBotsUrl = settingsForUrl.allBotsUrl || ALL_BOTS_URL;
+  const allBotsUrl = (await getDB('settings/allBotsUrl')) || ALL_BOTS_URL;
   keyboard.push([{ text: t('btn_all_bots', lang), url: allBotsUrl }]);
 
   const baseAboutText = t('about', lang);
@@ -1066,12 +1208,12 @@ async function showMainMenu(chatId) {
   if (licActive) header = `✅ Lisenziya Aktivdir!${licExpText}\n\n`;
   else if (isFrozen) header = `❄️ Lisenziya dondurulub.\n\n`;
   const finalAbout = header + baseAboutText;
-  await sendOrUpdate(chatId, finalAbout, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } });
+  await sendOrUpdate(chatId, finalAbout, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }, noBack: true });
 }
 
 async function isSubscribed(userId) {
-  const settings = await getDB('settings');
-  const channels = [settings?.channel2_id, settings?.channel3_id].filter(Boolean);
+  const [c2, c3] = await Promise.all([getDB('settings/channel2_id'), getDB('settings/channel3_id')]);
+  const channels = [c2, c3].filter(Boolean);
   if (channels.length === 0) return true;
   for (const ch of channels) {
     try {
@@ -1106,9 +1248,14 @@ async function resolveEntity(client, raw) {
 // ============ BOT START ============
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
+  // köhnə menyu və /start mesajı silinir -> çatda yığılma olmur
+  bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+  const oldMenu = mainMsgIds[chatId];
+  if (oldMenu) bot.deleteMessage(chatId, oldMenu).catch(() => {});
   mainMsgIds[chatId] = undefined;
+  cleanupSession(chatId);
   await setDB(`users/${chatId}/state`, 'START');
-  await saveUserProfile(chatId, msg.from);
+  saveUserProfile(chatId, msg.from).catch(() => {});
   const keyboard = {
     inline_keyboard: [
       [{ text: '🇦🇿 Azərbaycan', callback_data: 'lang_az' }, { text: '🇹🇷 Türkçe', callback_data: 'lang_tr' }],
@@ -1120,26 +1267,37 @@ bot.onText(/\/start/, async (msg) => {
 });
 
 // ============ CALLBACK ============
-bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data;
-  const user = await getDB(`users/${chatId}`) || {};
-  const lang = user.lang || 'az';
-  await bot.answerCallbackQuery(query.id);
-  if (query.from) await saveUserProfile(chatId, query.from).catch(() => {});
+bot.on('callback_query', (query) => {
+  onCallback(query).catch(e => console.error('Callback xətası:', e && e.message));
+});
+
+async function onCallback(query) {
+  const internal = !!query.internal;
+  const chatId = (query.message && query.message.chat && query.message.chat.id) || (query.from && query.from.id);
+  const data = query.data || '';
+  // Düyməyə DƏRHAL cavab (DB-ni gözləmədən) -> "query is too old" xətası və donma yoxdur
+  if (!internal) bot.answerCallbackQuery(query.id).catch(() => {});
+  const lang = await getLang(chatId);
 
   if (data.startsWith('bc_open_')) { await handleBroadcastOpen(query, lang); return; }
 
+  // Basılan düymənin olduğu mesaj həmişə aktiv menyu mesajı olur (restartdan sonra da yeni mesaj yaranmır)
+  if (!internal && query.message && query.message.message_id) mainMsgIds[chatId] = query.message.message_id;
+  if (!internal && query.from) {
+    const last = global.profileSavedAt[chatId] || 0;
+    if (Date.now() - last > 30 * 60 * 1000) { global.profileSavedAt[chatId] = Date.now(); saveUserProfile(chatId, query.from).catch(() => {}); }
+  }
+
   if (data.startsWith('lang_') || data === 'check_sub') {
     let newLang = lang;
-    if (data.startsWith('lang_')) { newLang = data.split('_')[1]; await setDB(`users/${chatId}/lang`, newLang); }
+    if (data.startsWith('lang_')) { newLang = data.split('_')[1]; setLangCache(chatId, newLang); await setDB(`users/${chatId}/lang`, newLang); }
     if (data === 'check_sub') {
       const wait = await bot.sendMessage(chatId, t('checking', newLang));
       const ok = await isSubscribed(query.from.id);
       await bot.deleteMessage(chatId, wait.message_id).catch(() => {});
       if (ok) { await showMainMenu(chatId); return; }
     }
-    const settings = await getDB('settings') || {};
+    const settings = { channel2: await getDB('settings/channel2') };
     const keyboard = {
       inline_keyboard: [
         [{ text: t('ch1_btn', newLang), url: settings.channel2 || 'https://t.me/EliteBotMedia' }],
@@ -1148,12 +1306,12 @@ bot.on('callback_query', async (query) => {
       ]
     };
     const txt = data === 'check_sub' ? t('not_subscribed', newLang) : t('sub_msg', newLang);
-    await sendOrUpdate(chatId, txt, { reply_markup: keyboard });
+    await sendOrUpdate(chatId, txt, { reply_markup: keyboard, noBack: true });
     return;
   }
 
   if (data === 'back_to_main' || data === 'cancel_operation') {
-    delete userSessions[chatId];
+    cleanupSession(chatId);
     await setDB(`users/${chatId}/state`, 'IDLE');
     await showMainMenu(chatId);
     return;
@@ -1161,11 +1319,12 @@ bot.on('callback_query', async (query) => {
 
   // ===== LICENSE INFO =====
   if (data === 'lic_info') {
-    if (!user.activeLicense) {
+    const activeLicenseCode = await getDB(`users/${chatId}/activeLicense`);
+    if (!activeLicenseCode) {
       await sendOrUpdate(chatId, t('no_lic', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
       return;
     }
-    const lic = await getDB(`licenses/${user.activeLicense}`);
+    const lic = await getDB(`licenses/${activeLicenseCode}`);
     if (!lic) {
       await sendOrUpdate(chatId, t('not_found_lic', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
       return;
@@ -1197,7 +1356,7 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'add_new_number') {
-    const userData = await getDB(`users/${chatId}`);
+    const userData = await getUserFields(chatId, ['activeLicense', 'accounts']);
     if (!userData?.activeLicense) {
       await sendOrUpdate(chatId, t('no_lic', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
       return;
@@ -1220,7 +1379,7 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'manage_numbers') {
-    const userData = await getDB(`users/${chatId}`);
+    const userData = await getUserFields(chatId, ['accounts']);
     if (!userData?.accounts || Object.keys(userData.accounts).length === 0) {
       await sendOrUpdate(chatId, t('no_numbers', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
       return;
@@ -1314,7 +1473,7 @@ bot.on('callback_query', async (query) => {
     const id = data.replace('lib_delok_', '');
     await setDB(`users/${chatId}/library/sources/${id}`, null);
     bot.sendMessage(chatId, t('lib_deleted', lang)).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 3000));
-    await bot.emit('callback_query', { message: query.message, data: 'library_menu', id: query.id, from: query.from });
+    await onCallback({ message: query.message, data: 'library_menu', id: query.id, from: query.from, internal: true });
     return;
   }
 
@@ -1323,7 +1482,7 @@ bot.on('callback_query', async (query) => {
     const id = data.replace('lib_use_', '');
     const src = await getDB(`users/${chatId}/library/sources/${id}`);
     if (!src) { await showMainMenu(chatId); return; }
-    const userData = await getDB(`users/${chatId}`);
+    const userData = await getUserFields(chatId, ['accounts']);
     if (!userData.accounts || Object.keys(userData.accounts).length === 0) {
       await sendOrUpdate(chatId, t('no_numbers', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
       return;
@@ -1347,13 +1506,13 @@ bot.on('callback_query', async (query) => {
       type: 'library', sourceId: id, name: src.name
     });
     bot.sendMessage(chatId, t('lib_set_as_source', lang, { name: src.name })).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 4000));
-    await bot.emit('callback_query', { message: query.message, data: `source_${phone}`, id: query.id, from: query.from });
+    await onCallback({ message: query.message, data: `source_${phone}`, id: query.id, from: query.from, internal: true });
     return;
   }
 
   // ===== STATS =====
   if (data === 'stats_menu') {
-    const userData = await getDB(`users/${chatId}`);
+    const userData = await getUserFields(chatId, ['accounts']);
     if (!userData?.accounts || Object.keys(userData.accounts).length === 0) {
       await sendOrUpdate(chatId, t('stats_no_data', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
       return;
@@ -1383,7 +1542,7 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'auto_reply_menu') {
-    const userData = await getDB(`users/${chatId}`) || {};
+    const userData = await getUserFields(chatId, ['autoReplyEnabled', 'autoReplyMessage']);
     const enabled = userData.autoReplyEnabled || false;
     const txt = userData.autoReplyMessage || '—';
     const status = enabled ? t('auto_reply_on', lang) : t('auto_reply_off', lang);
@@ -1401,13 +1560,14 @@ bot.on('callback_query', async (query) => {
     return;
   }
   if (data === 'ar_reset_cd') {
+    await setDB(`autoReplyCooldowns/${chatId}`, null);
     await setDB(`users/${chatId}/autoReplyCooldowns`, null);
     for (const k of Object.keys(global.autoReplyLast)) if (k.startsWith(`${chatId}_`)) delete global.autoReplyLast[k];
     bot.sendMessage(chatId, '✅ Cooldown sıfırlandı. İndi eyni şəxs yenidən yazsa cavab alacaq.').then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 6000)).catch(() => {});
     return;
   }
   if (data === 'ar_diag') {
-    const ud = await getDB(`users/${chatId}`) || {};
+    const ud = await getUserFields(chatId, ['autoReplyEnabled', 'autoReplyMessage', 'accounts']);
     let txt = `🔧 Avtocavab diaqnostikası\nAktiv: ${ud.autoReplyEnabled ? 'Bəli' : 'Xeyr'} | Mətn: ${ud.autoReplyMessage ? 'var' : 'YOXDUR'}\n`;
     const days = (await getDB('settings/autoReplyCooldownDays')) || DEFAULT_AUTOREPLY_COOLDOWN_DAYS;
     txt += `Cooldown: ${days} gün (eyni şəxsə)\n\n`;
@@ -1457,10 +1617,7 @@ bot.on('callback_query', async (query) => {
       for (const phone in userData.accounts) {
         if (newState) {
           clearAbort(chatId, phone);
-          await setDB(`users/${chatId}/accounts/${phone}/status`, 'ACTIVE');
-          await resetSchedule(chatId, phone);
-          await setDB(`users/${chatId}/accounts/${phone}/pauseUntil`, null);
-          await setDB(`users/${chatId}/accounts/${phone}/toursCompleted`, 0);
+          await activateAccount(chatId, phone);
           if (userData.autoReplyMessage) {
             ensureAutoReplyClient(chatId, phone, userData.accounts[phone], { ...userData, autoReplyEnabled: true });
           }
@@ -1487,17 +1644,40 @@ bot.on('callback_query', async (query) => {
         await setDB(`users/${chatId}/accounts/${phone}/status`, 'STOPPED');
       } else {
         clearAbort(chatId, phone);
-        await setDB(`users/${chatId}/accounts/${phone}/status`, 'ACTIVE');
-        await resetSchedule(chatId, phone);
-        await setDB(`users/${chatId}/accounts/${phone}/pauseUntil`, null);
-        await setDB(`users/${chatId}/accounts/${phone}/toursCompleted`, 0);
-        const userData = await getDB(`users/${chatId}`) || {};
+        await activateAccount(chatId, phone);
+        const userData = await getUserFields(chatId, ['autoReplyEnabled', 'autoReplyMessage']);
         if (userData.autoReplyEnabled && userData.autoReplyMessage) ensureAutoReplyClient(chatId, phone, acc, userData);
       }
       const msg = newStatus === 'STOPPED' ? t('stop_single', lang, { phone }) : t('resume_single', lang, { phone });
       bot.sendMessage(chatId, msg).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 5000));
-      await bot.emit('callback_query', { message: query.message, data: 'manage_numbers', id: query.id, from: query.from });
+      await onCallback({ message: query.message, data: 'manage_numbers', id: query.id, from: query.from, internal: true });
     }
+    return;
+  }
+
+  if (data.startsWith('delete_')) {
+    const phone = data.replace('delete_', '');
+    const kb = { inline_keyboard: [[
+      { text: t('confirm_delete_num_yes', lang), callback_data: `delok_${phone}` },
+      { text: t('confirm_delete_num_no', lang), callback_data: 'manage_numbers' }
+    ]] };
+    await sendOrUpdate(chatId, t('confirm_delete_num', lang, { phone }), { reply_markup: kb });
+    return;
+  }
+  if (data.startsWith('delok_')) {
+    const phone = data.replace('delok_', '');
+    requestAbort(chatId, phone);
+    await stopAutoReplyClient(chatId, phone);
+    await killClient(accTaskKey(chatId, phone));
+    const licCode = await getDB(`users/${chatId}/activeLicense`);
+    await setDB(`users/${chatId}/accounts/${phone}`, null);
+    if (licCode) {
+      await setDB(`licenses/${licCode}/registeredPhones/${phone}`, null);
+      syncLicenseUserInfo(chatId, licCode, query.from).catch(() => {});
+    }
+    delete global.localNextRun[accTaskKey(chatId, phone)];
+    bot.sendMessage(chatId, t('num_deleted', lang, { phone })).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 3000)).catch(() => {});
+    await onCallback({ message: query.message, data: 'manage_numbers', id: query.id, from: query.from, internal: true });
     return;
   }
 
@@ -1633,7 +1813,7 @@ bot.on('callback_query', async (query) => {
       acc.targetGroups.splice(idx, 1);
       await setDB(`users/${chatId}/accounts/${phone}/targetGroups`, acc.targetGroups);
       bot.sendMessage(chatId, t('group_deleted', lang)).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 3000));
-      await bot.emit('callback_query', { message: query.message, data: `groups_${phone}`, id: query.id, from: query.from });
+      await onCallback({ message: query.message, data: `groups_${phone}`, id: query.id, from: query.from, internal: true });
     }
     return;
   }
@@ -1653,7 +1833,7 @@ bot.on('callback_query', async (query) => {
       const order = ['auto', 'keep', 'hide'];
       const next = order[(order.indexOf(acc.forwardMode || 'auto') + 1) % 3];
       await setDB(`users/${chatId}/accounts/${phone}/forwardMode`, next);
-      await bot.emit('callback_query', { message: query.message, data: `source_${phone}`, id: query.id, from: query.from });
+      await onCallback({ message: query.message, data: `source_${phone}`, id: query.id, from: query.from, internal: true });
     }
     return;
   }
@@ -1683,7 +1863,7 @@ bot.on('callback_query', async (query) => {
     const phone = data.replace('delsource_', '');
     await setDB(`users/${chatId}/accounts/${phone}/messageSource`, { type: 'saved' });
     bot.sendMessage(chatId, t('source_deleted', lang)).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 3000));
-    await bot.emit('callback_query', { message: query.message, data: `source_${phone}`, id: query.id, from: query.from });
+    await onCallback({ message: query.message, data: `source_${phone}`, id: query.id, from: query.from, internal: true });
     return;
   }
   if (data.startsWith('changesource_')) {
@@ -1709,12 +1889,6 @@ bot.on('callback_query', async (query) => {
       await sendOrUpdate(chatId, t('lib_empty', lang), { reply_markup: { inline_keyboard: [[{ text: t('lib_new', lang), callback_data: 'lib_new' }], [{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
       return;
     }
-    const kb = [];
-    sources.slice(0, 30).forEach(([id, s]) => {
-      const icon = s.contentType === 'photo' ? '🖼' : s.contentType === 'video' ? '🎬' : '📝';
-      kb.push([{ text: `${icon} ${s.name}`, callback_data: `lib_assign_${id}_${user.currentPhoneSetup || ''}` }]);
-    });
-    // We need phone from currentPhoneSetup - retrieve it
     const phone = await getDB(`users/${chatId}/currentPhoneSetup`);
     const kb2 = [];
     sources.slice(0, 30).forEach(([id, s]) => {
@@ -1745,13 +1919,12 @@ bot.on('callback_query', async (query) => {
     await sendOrUpdate(chatId, t('source_prompt', lang), { reply_markup: kb });
     return;
   }
-});
+}
 
 async function sendScanPage(chatId) {
   const session = userSessions[chatId];
   if (!session?.scanGroups) return;
-  const user = await getDB(`users/${chatId}`) || {};
-  const lang = user.lang || 'az';
+  const lang = await getLang(chatId);
   const perPage = 15;
   const total = Math.ceil(session.scanGroups.length / perPage);
   let page = session.scanPage;
@@ -1785,13 +1958,17 @@ bot.on('message', async (msg) => {
     if (msg.text && msg.text.startsWith('/')) return;
     if (!msg.text && !msg.photo && !msg.video && !msg.document) return;
     const chatId = msg.chat.id;
-    const botInfo = await bot.getMe();
-    if (msg.from.id === botInfo.id) return;
+    if (!global.botId) { try { global.botId = (await bot.getMe()).id; } catch (e) {} }
+    if (msg.from && msg.from.id === global.botId) return;
 
-    const user = await getDB(`users/${chatId}`) || {};
-    const lang = user.lang || 'az';
-    const state = await getDB(`users/${chatId}/state`) || 'IDLE';
+    const [lang, stateRaw] = await Promise.all([getLang(chatId), getDB(`users/${chatId}/state`)]);
+    const state = stateRaw || 'IDLE';
     const text = (msg.text || msg.caption || '').trim();
+
+    // İstifadəçinin daxil etdiyi mətn/kod/şəkil mesajı çatdan silinir -> menyu altında yığılma olmur
+    if (/^AWAITING_(LICENSE|PHONE|OTP|GROUP|CUSTOM_SOURCE|INTERVAL|CHANGE_INTERVAL|AUTO_REPLY|LIB_NAME|LIB_CONTENT)$/.test(state)) {
+      bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+    }
 
     if (text === t('cancel_btn', lang)) {
       delete userSessions[chatId];
@@ -1814,575 +1991,4 @@ bot.on('message', async (msg) => {
       await setDB(`users/${chatId}/activeLicense`, text);
       await saveUserProfile(chatId, msg.from);
       await syncLicenseUserInfo(chatId, text, msg.from);
-      delete global.expiredNotified[chatId];
-      delete global.frozenNotified[chatId];
-      await setDB(`users/${chatId}/state`, 'IDLE');
-      bot.sendMessage(chatId, t('success_lic', lang)).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 3000));
-      await showMainMenu(chatId);
-      return;
-    }
-
-    if (state === 'AWAITING_PHONE') {
-      if (!text.startsWith('+')) { await sendOrUpdate(chatId, t('phone_format', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      const wait = await bot.sendMessage(chatId, t('otp_sent', lang));
-      try {
-        const client = new TelegramClient(new StringSession(''), API_ID, API_HASH, { connectionRetries: 3 });
-        await client.connect();
-        const { phoneCodeHash } = await client.sendCode({ apiId: API_ID, apiHash: API_HASH }, text);
-        userSessions[chatId] = { client, phone: text, phoneCodeHash };
-        await setDB(`users/${chatId}/currentPhoneSetup`, text);
-        await setDB(`users/${chatId}/state`, 'AWAITING_OTP');
-        await bot.deleteMessage(chatId, wait.message_id).catch(() => {});
-        const kb = { inline_keyboard: [[{ text: t('cancel_btn', lang), callback_data: 'cancel_operation' }]] };
-        await sendOrUpdate(chatId, t('otp_info', lang), { reply_markup: kb });
-      } catch (e) {
-        await bot.deleteMessage(chatId, wait.message_id).catch(() => {});
-        await sendOrUpdate(chatId, t('err', lang) + e.message, { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
-      }
-      return;
-    }
-
-    if (state === 'AWAITING_OTP') {
-      const session = userSessions[chatId];
-      if (!session) { await sendOrUpdate(chatId, t('sess_lost', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      const otp = text.replace(/\s/g, '');
-      try {
-        await session.client.invoke(new Api.auth.SignIn({
-          phoneNumber: session.phone, phoneCodeHash: session.phoneCodeHash, phoneCode: otp
-        }));
-        const saved = session.client.session.save();
-        const phoneKey = session.phone.replace('+', '');
-        await setDB(`users/${chatId}/accounts/${phoneKey}/telegramSession`, saved);
-        await setDB(`users/${chatId}/accounts/${phoneKey}/targetGroups`, []);
-        await setDB(`users/${chatId}/accounts/${phoneKey}/status`, 'STOPPED');
-        await setDB(`users/${chatId}/accounts/${phoneKey}/intervalSeconds`, 120);
-        await setDB(`users/${chatId}/accounts/${phoneKey}/messageSource`, { type: 'saved' });
-        const userData = await getDB(`users/${chatId}`);
-        if (userData?.activeLicense) {
-          await setDB(`licenses/${userData.activeLicense}/registeredPhones/${phoneKey}`, true);
-          await syncLicenseUserInfo(chatId, userData.activeLicense, msg.from);
-        }
-        await setDB(`users/${chatId}/state`, 'AWAITING_GROUP');
-        await setDB(`users/${chatId}/currentPhoneSetup`, phoneKey);
-        const kb = { inline_keyboard: [[{ text: t('cancel_btn', lang), callback_data: 'cancel_operation' }]] };
-        await sendOrUpdate(chatId, t('login_success', lang, { phone: session.phone }), { parse_mode: 'Markdown', reply_markup: kb });
-      } catch (e) {
-        await sendOrUpdate(chatId, t('otp_err', lang) + e.message, { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
-      }
-      return;
-    }
-
-    if (state === 'AWAITING_GROUP') {
-      const phone = await getDB(`users/${chatId}/currentPhoneSetup`);
-      if (!phone) return showMainMenu(chatId);
-      const existing = await getDB(`users/${chatId}/accounts/${phone}/targetGroups`) || [];
-      existing.push(text);
-      await setDB(`users/${chatId}/accounts/${phone}/targetGroups`, existing);
-      const kb = {
-        inline_keyboard: [
-          [{ text: t('add_more', lang), callback_data: 'add_more_group' }],
-          [{ text: t('finish_btn', lang), callback_data: 'finish_groups' }],
-          [{ text: t('cancel_btn', lang), callback_data: 'cancel_operation' }]
-        ]
-      };
-      await sendOrUpdate(chatId, t('group_added', lang, { count: existing.length }), { reply_markup: kb });
-      return;
-    }
-
-    if (state === 'AWAITING_CUSTOM_SOURCE') {
-      const phone = await getDB(`users/${chatId}/currentPhoneSetup`);
-      if (!phone) return showMainMenu(chatId);
-      const acc = await getDB(`users/${chatId}/accounts/${phone}`);
-      if (!acc?.telegramSession) { await sendOrUpdate(chatId, t('sess_lost', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      let cl;
-      try {
-        cl = new TelegramClient(new StringSession(acc.telegramSession), API_ID, API_HASH, { connectionRetries: 1 });
-        await cl.connect();
-        const entityTarget = await resolveEntity(cl, text);
-        const entity = await cl.getEntity(entityTarget).catch(() => entityTarget);
-        await cl.getMessages(entity, { limit: 1 });
-      } catch (e) {
-        if (cl) try { await cl.disconnect(); } catch (e2) {}
-        await sendOrUpdate(chatId, t('invalid_source', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
-        return;
-      } finally { if (cl) try { await cl.disconnect(); } catch (e) {} }
-      await setDB(`users/${chatId}/accounts/${phone}/messageSource`, { type: 'custom', target: text });
-      await setDB(`users/${chatId}/state`, 'AWAITING_INTERVAL');
-      const kb = { inline_keyboard: [[{ text: t('cancel_btn', lang), callback_data: 'cancel_operation' }]] };
-      await sendOrUpdate(chatId, t('ask_interval', lang), { reply_markup: kb });
-      return;
-    }
-
-    if (state === 'AWAITING_INTERVAL' || state === 'AWAITING_CHANGE_INTERVAL') {
-      const sec = parseInt(text);
-      if (isNaN(sec) || sec < 120 || sec > 300) { await sendOrUpdate(chatId, t('interval_err', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      if (state === 'AWAITING_CHANGE_INTERVAL') {
-        const phone = await getDB(`users/${chatId}/changingIntervalPhone`);
-        if (phone) {
-          await setDB(`users/${chatId}/accounts/${phone}/intervalSeconds`, sec);
-          await resetSchedule(chatId, phone);
-          await setDB(`users/${chatId}/state`, 'IDLE');
-          await setDB(`users/${chatId}/changingIntervalPhone`, null);
-          bot.sendMessage(chatId, t('interval_updated', lang, { sec })).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 3000));
-          await showMainMenu(chatId);
-        }
-        return;
-      }
-      const phone = await getDB(`users/${chatId}/currentPhoneSetup`);
-      if (phone) {
-        await setDB(`users/${chatId}/accounts/${phone}/intervalSeconds`, sec);
-        await resetSchedule(chatId, phone);
-        await setDB(`users/${chatId}/state`, 'IDLE');
-        delete userSessions[chatId];
-        await sendOrUpdate(chatId, `✅ İnterval: ${sec}s.\nİdarə panelindən "▶️ Başlat" vurun.`, { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } });
-      }
-      return;
-    }
-
-    if (state === 'AWAITING_AUTO_REPLY') {
-      await setDB(`users/${chatId}/autoReplyMessage`, msg.text || msg.caption || text);
-      await setDB(`users/${chatId}/autoReplyEntities`, msg.entities || msg.caption_entities || null);
-      delete global.arCfgCache[chatId];
-      await setDB(`users/${chatId}/autoReplyEnabled`, true);
-      await setDB(`users/${chatId}/state`, 'IDLE');
-      bot.sendMessage(chatId, t('auto_reply_set', lang)).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 5000));
-      const userData = await getDB(`users/${chatId}`) || {};
-      if (userData.accounts) for (const phone in userData.accounts) ensureAutoReplyClient(chatId, phone, userData.accounts[phone], userData);
-      await showMainMenu(chatId);
-      return;
-    }
-
-    // ===== LIBRARY CREATION =====
-    if (state === 'AWAITING_LIB_NAME') {
-      userSessions[chatId] = { libName: text };
-      await setDB(`users/${chatId}/state`, 'AWAITING_LIB_CONTENT');
-      const kb = { inline_keyboard: [[{ text: t('cancel_btn', lang), callback_data: 'cancel_operation' }]] };
-      await sendOrUpdate(chatId, t('lib_new_content', lang), { reply_markup: kb });
-      return;
-    }
-
-    if (state === 'AWAITING_LIB_CONTENT') {
-      const name = userSessions[chatId]?.libName || 'Mənbə';
-      const sourceId = `src_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-      const lib = { id: sourceId, name, createdAt: Date.now() };
-      if (msg.photo) {
-        lib.contentType = 'photo';
-        lib.fileId = msg.photo[msg.photo.length - 1].file_id;
-        lib.caption = msg.caption || '';
-        lib.entities = msg.caption_entities || null;
-        lib.text = null;
-      } else if (msg.video) {
-        lib.contentType = 'video';
-        lib.fileId = msg.video.file_id;
-        lib.caption = msg.caption || '';
-        lib.entities = msg.caption_entities || null;
-        lib.text = null;
-      } else if (msg.document) {
-        lib.contentType = 'document';
-        lib.fileId = msg.document.file_id;
-        lib.fileName = msg.document.file_name || null;
-        lib.caption = msg.caption || '';
-        lib.entities = msg.caption_entities || null;
-        lib.text = null;
-      } else {
-        lib.contentType = 'text';
-        lib.text = msg.text || '';
-        lib.entities = msg.entities || null;
-        lib.fileId = null;
-        lib.caption = null;
-      }
-      await setDB(`users/${chatId}/library/sources/${sourceId}`, lib);
-      delete userSessions[chatId];
-      await setDB(`users/${chatId}/state`, 'IDLE');
-      if (hasBotCustomEmoji(lib.entities)) bot.sendMessage(chatId, '💎 Premium emoji aşkarlandı. Onlar yalnız Telegram Premium olan hesabdan olduğu kimi göndərilir; Premium olmayan hesabda adi emojiyə çevrilir. Premium olmayan hesab üçün "Yadda saxlanmış mesajlar" və ya "Xüsusi kanal" mənbəyindən istifadə edin.').then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 15000)).catch(() => {});
-      bot.sendMessage(chatId, t('lib_saved', lang, { name })).then(m => setTimeout(() => bot.deleteMessage(chatId, m.message_id).catch(() => {}), 4000));
-      await bot.emit('callback_query', { message: { chat: { id: chatId } }, data: 'library_menu', id: 'x', from: msg.from });
-      return;
-    }
-
-  } catch (e) { console.error('Message handler:', e); }
-});
-
-// ============ MESSAGE SENDING LOOP ============
-// Peşəkar, spam-sız rejim:
-//  - hər hesab üçün interval (120-300 san) turun BİTMƏSİNDƏN hesablanır, ±10% təsadüfi sapma ilə
-//  - qruplar arası 6-15 san (hər 8 qrupdan sonra əlavə 20-40 san) fasilə
-//  - 5 tur → 30 dəq fasilə (köhnə qayda saxlanılıb)
-//  - SlowMode / Flood / Restrict olan qruplar müvəqqəti kənarlaşdırılır, təkrar-təkrar vurulmur
-//  - eyni anda maksimum 3 hesab işləyir
-//  - xəta olsa belə növbəti cəhd interval qədər gözləyir (əvvəlki versiyada 10 san-dən bir təkrar olurdu)
-const MAX_CONCURRENT_TASKS = 3;
-global.groupBlockedUntil = global.groupBlockedUntil || {};
-
-function getIntervalMs(acc) {
-  let sec = acc.intervalSeconds;
-  if (!sec && acc.intervalMinutes) sec = acc.intervalMinutes * 60;
-  if (!sec) sec = 120;
-  return Math.max(120, Math.min(300, sec)) * 1000;
-}
-function jitter(ms, pct = 0.1) { return Math.round(ms * (1 - pct + Math.random() * 2 * pct)); }
-function waitSecondsFromError(err) {
-  if (err && typeof err.seconds === 'number') return err.seconds;
-  const m = String(err?.errorMessage || err?.message || '').match(/(\d+)\s*(?:SECONDS?|SEC)|_(\d+)$/i);
-  if (m) return parseInt(m[1] || m[2]);
-  return 0;
-}
-async function resetSchedule(chatId, phone) {
-  await updateDB(`users/${chatId}/accounts/${phone}`, { lastSentAt: 0, nextRunAt: null });
-}
-
-setInterval(async () => {
-  if (global.tickBusy) return;
-  global.tickBusy = true;
-  try {
-    const users = await getDB('users');
-    if (!users) return;
-    const toursBeforePause = 5, pauseMinutes = 30;
-    const licCache = {};
-
-    outer:
-    for (const chatId in users) {
-      const user = users[chatId];
-      if (!user.accounts) continue;
-
-      let licenseOk = true;
-      if (user.activeLicense) {
-        if (!(user.activeLicense in licCache)) licCache[user.activeLicense] = await getDB(`licenses/${user.activeLicense}`);
-        const lic = licCache[user.activeLicense];
-        if (!lic) continue;
-        if (isLicenseFrozen(lic)) { await frozenAndNotify(chatId, user); continue; }
-        licenseOk = isLicenseCurrentlyValid(lic);
-        if (!licenseOk) { await expireAndNotify(chatId, user); continue; }
-      }
-
-      for (const phone in user.accounts) {
-        if (global.runningAccounts.size >= MAX_CONCURRENT_TASKS) break outer;
-        const acc = user.accounts[phone];
-        if (!acc.telegramSession) continue;
-        const taskKey = accTaskKey(chatId, phone);
-        if (global.runningAccounts.has(taskKey)) continue;
-
-        const groups = acc.targetGroups || [];
-        if (!licenseOk || acc.status !== 'ACTIVE' || groups.length === 0) continue;
-        if (acc.pauseUntil && Date.now() < acc.pauseUntil) continue;
-
-        const now = Date.now();
-        const due = acc.nextRunAt ? now >= acc.nextRunAt : (now - (acc.lastSentAt || 0) >= getIntervalMs(acc));
-        if (!due) continue;
-
-        global.runningAccounts.add(taskKey);
-        processAccountTask(chatId, phone, user, acc, groups, { toursBeforePause, pauseMinutes })
-          .catch(e => console.error('Task:', e.message))
-          .finally(() => global.runningAccounts.delete(taskKey));
-      }
-    }
-  } catch (e) { console.error('Interval:', e); }
-  finally { global.tickBusy = false; }
-}, 10000);
-
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timeout`)), ms); });
-  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
-}
-
-async function processAccountTask(chatId, phone, user, acc, groups, tourCfg = {}) {
-  const lang = user?.lang || 'az';
-  const key = accTaskKey(chatId, phone);
-  const toursBeforePause = tourCfg.toursBeforePause || DEFAULT_TOURS_BEFORE_PAUSE;
-  const pauseMinutes = tourCfg.pauseMinutes || DEFAULT_PAUSE_MINUTES;
-  const intervalMs = getIntervalMs(acc);
-  let scheduled = false;
-
-  const schedule = async (delayMs, extra = {}) => {
-    scheduled = true;
-    await updateDB(`users/${chatId}/accounts/${phone}`, { lastSentAt: Date.now(), nextRunAt: Date.now() + delayMs, ...extra });
-  };
-
-  try {
-    const entry = await getSharedClient(key, acc.telegramSession);
-    const client = entry.client;
-    if (Date.now() - entry.dialogsAt > 30 * 60 * 1000) {
-      await client.getDialogs({ limit: 100 }).catch(() => {});
-      entry.dialogsAt = Date.now();
-    }
-    if (isAborted(chatId, phone)) return;
-
-    const source = acc.messageSource || { type: 'saved' };
-    let sourceMode = 'forward';
-    let sourceEntity = 'me';
-    let sourceMsgIds = [];
-    let libSource = null;
-
-    if (source.type === 'library' && source.sourceId) {
-      libSource = await getDB(`users/${chatId}/library/sources/${source.sourceId}`);
-      if (libSource) sourceMode = 'library';
-    }
-    if (sourceMode === 'forward') {
-      if (source.type === 'custom' && source.target) {
-        const entityTarget = await resolveEntity(client, source.target);
-        sourceEntity = await client.getEntity(entityTarget).catch(() => entityTarget);
-      }
-      sourceMsgIds = await fetchSourceMessages(client, sourceEntity);
-    }
-
-    const canSend = sourceMode === 'library' ? !!libSource : (sourceMsgIds && sourceMsgIds.length > 0);
-    let abortedMidRound = false;
-    let sentCount = 0;
-
-    if (canSend) {
-      for (let i = 0; i < groups.length; i++) {
-        if (isAborted(chatId, phone)) { abortedMidRound = true; break; }
-        const g = groups[i];
-        const blockKey = `${key}|${g}`;
-        if ((global.groupBlockedUntil[blockKey] || 0) > Date.now()) continue; // slowmode/restrict olan qrup
-
-        if (sentCount > 0) {
-          let delay = 6000 + Math.random() * 9000;
-          if (sentCount % 8 === 0) delay += 20000 + Math.random() * 20000;
-          const continued = await interruptibleSleep(delay, () => isAborted(chatId, phone));
-          if (!continued) { abortedMidRound = true; break; }
-        }
-
-        try {
-          const targetStr = await resolveEntity(client, g);
-          const peer = (typeof targetStr === 'string' && /^-?\d+$/.test(targetStr)) ? BigInt(targetStr) : targetStr;
-          const target = await client.getEntity(peer).catch(() => peer);
-          if (!target) continue;
-
-          let ok;
-          if (sourceMode === 'library') ok = await sendLibrarySource(client, libSource, target);
-          else ok = await sendSourceAsOriginal(client, sourceEntity, sourceMsgIds, target, entry.isPremium, acc.forwardMode || 'auto');
-          if (typeof ok === 'string' && ok.startsWith('emoji:') && shouldNotifyError(`emoji_${chatId}_${phone}`, 60 * 60 * 1000)) {
-            await notifyUser(chatId, `💎 Premium emoji mesajı göndərildi (+${phone})\nHesab Premium: ${entry.isPremium ? 'Bəli' : 'Xeyr'}\nÜsul: ${ok.split(':')[1]}`);
-          }
-          sentCount++;
-
-          if (ok) {
-            await trackSend(chatId, phone, sourceMode === 'library' ? libSource.contentType : 'forward', true);
-            const groupName = target.title || target.username || g;
-            try {
-              const notifMsg = await bot.sendMessage(chatId, `✅ Mesaj atıldı: ${groupName}`);
-              setTimeout(() => { bot.deleteMessage(chatId, notifMsg.message_id).catch(() => {}); }, 10000 + Math.floor(Math.random() * 2000));
-            } catch (err) {}
-          } else {
-            await trackSend(chatId, phone, 'unknown', false);
-          }
-        } catch (e) {
-          await trackSend(chatId, phone, 'unknown', false);
-          const kind = classifySendError(e);
-          const detail = e.message || String(e);
-          console.log(`Send error [${kind}]:`, detail);
-
-          if (kind === 'slowmode') {
-            const sec = waitSecondsFromError(e) || 60;
-            global.groupBlockedUntil[blockKey] = Date.now() + (sec + 5) * 1000;
-            continue;
-          }
-          if (kind === 'logout') {
-            requestAbort(chatId, phone);
-            await setDB(`users/${chatId}/accounts/${phone}/status`, 'STOPPED');
-            if (shouldNotifyError(`logout_${chatId}_${phone}`, 30 * 60 * 1000)) await notifyUser(chatId, t('err_account_logout', lang, { phone, detail }));
-            abortedMidRound = true;
-            break;
-          }
-          if (kind === 'flood') {
-            const sec = waitSecondsFromError(e);
-            const waitMs = Math.max(10 * 60 * 1000, sec ? (sec + 60) * 1000 : 0);
-            await schedule(waitMs);
-            if (shouldNotifyError(`flood_${chatId}_${phone}`, 15 * 60 * 1000)) await notifyUser(chatId, t('err_account_flood', lang, { phone, detail }));
-            abortedMidRound = true;
-            break;
-          }
-          if (kind === 'restrict') {
-            global.groupBlockedUntil[blockKey] = Date.now() + 60 * 60 * 1000; // 1 saat dayandır
-            const groupName = String(g);
-            if (shouldNotifyError(`restrict_${chatId}_${phone}_${groupName}`, 20 * 60 * 1000)) {
-              await notifyUser(chatId, t('err_group_restrict', lang, { kind: restrictKind(e), group: groupName, phone, detail }));
-            }
-          } else {
-            global.groupBlockedUntil[blockKey] = Date.now() + 10 * 60 * 1000;
-            if (shouldNotifyError(`other_${chatId}_${phone}`, 20 * 60 * 1000)) await notifyUser(chatId, t('err_account_other', lang, { phone, detail }));
-          }
-        }
-      }
-    }
-
-    if (!abortedMidRound && !isAborted(chatId, phone)) {
-      const nextDelay = jitter(intervalMs);
-      const prevTours = parseInt(acc.toursCompleted) || 0;
-      const nextTours = prevTours + 1;
-      if (nextTours >= toursBeforePause) {
-        const pauseUntil = Date.now() + pauseMinutes * 60 * 1000;
-        await schedule(Math.max(nextDelay, pauseMinutes * 60 * 1000), { toursCompleted: 0, pauseUntil });
-        const pKey = `${chatId}_${phone}_${pauseUntil}`;
-        if (!global.pauseNotified[pKey]) {
-          global.pauseNotified[pKey] = true;
-          await notifyUser(chatId, t('pause_started', lang, { tours: toursBeforePause, min: pauseMinutes }));
-        }
-      } else {
-        await schedule(nextDelay, { toursCompleted: nextTours });
-      }
-    }
-  } catch (e) {
-    const kind = classifySendError(e);
-    const detail = e.message || String(e);
-    console.error('Task error:', detail);
-    if (kind === 'logout') {
-      requestAbort(chatId, phone);
-      await setDB(`users/${chatId}/accounts/${phone}/status`, 'STOPPED');
-      if (shouldNotifyError(`logout_${chatId}_${phone}`, 30 * 60 * 1000)) await notifyUser(chatId, t('err_account_logout', lang, { phone, detail }));
-    } else if (kind === 'flood') {
-      const sec = waitSecondsFromError(e);
-      await schedule(Math.max(10 * 60 * 1000, sec ? (sec + 60) * 1000 : 0)).catch(() => {});
-      if (shouldNotifyError(`flood_${chatId}_${phone}`, 15 * 60 * 1000)) await notifyUser(chatId, t('err_account_flood', lang, { phone, detail }));
-    }
-  } finally {
-    // Nə olursa olsun növbəti cəhd interval qədər sonra olsun (10 san-dən bir təkrar yoxdur)
-    if (!scheduled && !isAborted(chatId, phone)) {
-      await schedule(Math.max(intervalMs, 120000)).catch(() => {});
-    }
-    await releaseSharedClient(key).catch(() => {});
-  }
-}
-
-// ============ BİLDİRİŞ YAYIMI (ADMİN PANELDƏN) ============
-// Admin paneldə yazılan bildiriş bütün istifadəçilərə göndərilir.
-// İstifadəçi "Oxu" düyməsini basıb mesajı açdıqdan sonra mesaj N saniyə (default 15) sonra avtomatik silinir.
-const BC_TEXTS = {
-  az: { teaser: '📢 Yeni bildiriş var!', btn: '📖 Oxu', note: s => `⏳ Bu mesaj ${s} saniyə sonra avtomatik silinəcək.` },
-  tr: { teaser: '📢 Yeni bildirim var!', btn: '📖 Oku', note: s => `⏳ Bu mesaj ${s} saniye sonra otomatik silinecek.` },
-  en: { teaser: '📢 New announcement!', btn: '📖 Read', note: s => `⏳ This message will be deleted automatically in ${s} seconds.` },
-  ru: { teaser: '📢 Новое уведомление!', btn: '📖 Прочитать', note: s => `⏳ Это сообщение будет удалено через ${s} сек.` }
-};
-const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function getShallowKeys(path) {
-  try {
-    const r = await fetch(`${FIREBASE_URL}/${path}.json?shallow=true`);
-    const j = await r.json();
-    if (j && typeof j === 'object' && !j.error) return Object.keys(j);
-  } catch (e) {}
-  const full = await getDB(path); // ehtiyat yol
-  return full ? Object.keys(full) : [];
-}
-
-async function runBroadcast(id, b) {
-  const ids = (await getShallowKeys('users')).filter(u => /^-?\d+$/.test(u));
-  if (ids.length === 0) {
-    await updateDB(`settings/broadcasts/${id}`, { status: 'done', sent: 0, failed: 0, error: 'İstifadəçi siyahısı oxunmadı (Firebase Rules-ı yoxlayın)', finishedAt: Date.now() });
-    return;
-  }
-  await updateDB(`settings/broadcasts/${id}`, { total: ids.length });
-  let sent = 0, failed = 0, lastErr = '';
-  for (const uid of ids) {
-    const lang = (await getDB(`users/${uid}/lang`)) || 'az';
-    const tx = BC_TEXTS[lang] || BC_TEXTS.az;
-    let done = false;
-    for (let attempt = 0; attempt < 3 && !done; attempt++) {
-      try {
-        await bot.sendMessage(uid, tx.teaser, { reply_markup: { inline_keyboard: [[{ text: tx.btn, callback_data: `bc_open_${id}` }]] } });
-        sent++; done = true;
-      } catch (e) {
-        const retry = e?.response?.body?.parameters?.retry_after;
-        if (retry) { await sleepMs((retry + 1) * 1000); continue; }
-        failed++; done = true;
-        lastErr = String(e?.response?.body?.description || e.message || e).slice(0, 150);
-      }
-    }
-    if ((sent + failed) % 10 === 0) await updateDB(`settings/broadcasts/${id}`, { sent, failed });
-    await sleepMs(60);
-  }
-  await updateDB(`settings/broadcasts/${id}`, { status: 'done', sent, failed, error: lastErr || null, finishedAt: Date.now() });
-  console.log(`Broadcast ${id}: göndərildi=${sent}, uğursuz=${failed}`);
-}
-
-setInterval(async () => {
-  if (global.bcBusy) return;
-  global.bcBusy = true;
-  try {
-    const all = await getDB('settings/broadcasts');
-    if (!all) return;
-    for (const id in all) {
-      const b = all[id];
-      if (b && b.status === 'pending' && b.text) {
-        await updateDB(`settings/broadcasts/${id}`, { status: 'sending', startedAt: Date.now() });
-        await runBroadcast(id, b);
-      }
-    }
-  } catch (e) { console.error('Broadcast:', e.message); }
-  finally { global.bcBusy = false; }
-}, 10000);
-
-async function handleBroadcastOpen(query, lang) {
-  const chatId = query.message.chat.id;
-  const msgId = query.message.message_id;
-  const id = query.data.slice('bc_open_'.length);
-  const b = await getDB(`settings/broadcasts/${id}`);
-  if (!b || !b.text) { bot.deleteMessage(chatId, msgId).catch(() => {}); return; }
-  const ttl = Math.max(5, Math.min(300, parseInt(b.ttlSeconds) || 15));
-  const tx = BC_TEXTS[lang] || BC_TEXTS.az;
-  const full = `${b.text}\n\n${tx.note(ttl)}`;
-  try {
-    await bot.editMessageText(full, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' });
-  } catch (e) {
-    try { await bot.editMessageText(full, { chat_id: chatId, message_id: msgId }); } catch (e2) { return; }
-  }
-  const deleteAt = Date.now() + ttl * 1000;
-  await setDB(`settings/bcDeliveries/${id}/${chatId}`, { messageId: msgId, deleteAt });
-  const opened = (await getDB(`settings/broadcasts/${id}/opened`)) || 0;
-  await setDB(`settings/broadcasts/${id}/opened`, opened + 1);
-  setTimeout(async () => {
-    await bot.deleteMessage(chatId, msgId).catch(() => {});
-    await setDB(`settings/bcDeliveries/${id}/${chatId}`, null);
-  }, ttl * 1000);
-}
-
-// Restart olsa belə açılmış bildirişlər silinsin
-setInterval(async () => {
-  try {
-    const all = await getDB('settings/bcDeliveries');
-    if (!all) return;
-    for (const id in all) {
-      for (const uid in all[id]) {
-        const d = all[id][uid];
-        if (d && d.deleteAt && d.deleteAt <= Date.now()) {
-          await bot.deleteMessage(uid, d.messageId).catch(() => {});
-          await setDB(`settings/bcDeliveries/${id}/${uid}`, null);
-        }
-      }
-    }
-  } catch (e) {}
-}, 30000);
-
-// ============ PENDING PHONE CHANGE ============
-setInterval(async () => {
-  try {
-    const users = await getDB('users');
-    if (!users) return;
-    for (const chatId in users) {
-      const user = users[chatId];
-      if (user.pendingPhoneChange) {
-        const newPhone = user.pendingPhoneChange.newPhone;
-        const lang = user.lang || 'az';
-        try {
-          const client = new TelegramClient(new StringSession(''), API_ID, API_HASH, { connectionRetries: 1 });
-          await client.connect();
-          const { phoneCodeHash } = await client.sendCode({ apiId: API_ID, apiHash: API_HASH }, newPhone);
-          userSessions[chatId] = { client, phone: newPhone, phoneCodeHash };
-          await setDB(`users/${chatId}/currentPhoneSetup`, newPhone);
-          await setDB(`users/${chatId}/state`, 'AWAITING_OTP');
-          await setDB(`users/${chatId}/pendingPhoneChange`, null);
-          bot.sendMessage(chatId, t('admin_phone_change_prompt', lang), {
-            reply_markup: { inline_keyboard: [[{ text: t('cancel_btn', lang), callback_data: 'cancel_operation' }]] }
-          });
-        } catch (e) {
-          await setDB(`users/${chatId}/pendingPhoneChange`, null);
-          bot.sendMessage(chatId, t('err', lang) + e.message);
-        }
-      }
-    }
-  } catch (e) { console.error('pendingPhoneChange:', e); }
-}, 15000);
-
-console.log("Bot işə düşdü ✓");
+      delete gl
