@@ -1655,6 +1655,20 @@ async function onCallback(query) {
     return;
   }
 
+  if (data === 'otp_resend') {
+    const sess = userSessions[chatId];
+    if (!sess || !sess.client) { await sendOrUpdate(chatId, t('sess_lost', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
+    try {
+      const r = await withTimeout(sess.client.invoke(new Api.auth.ResendCode({ phoneNumber: sess.phone, phoneCodeHash: sess.phoneCodeHash })), 30000, 'ResendCode');
+      sess.phoneCodeHash = r.phoneCodeHash;
+      const where = otpWhereText(r.type && r.type.className, false);
+      await sendOrUpdate(chatId, `🔄 Kod yenidən göndərildi.\n${where}\n\n${t('otp_info', lang)}`, { reply_markup: otpKeyboard(lang) });
+    } catch (e) {
+      await sendOrUpdate(chatId, friendlyAuthError(e) || (t('err', lang) + (e.errorMessage || e.message)), { reply_markup: otpKeyboard(lang) });
+    }
+    return;
+  }
+
   if (data.startsWith('delete_')) {
     const phone = data.replace('delete_', '');
     const kb = { inline_keyboard: [[
@@ -1952,43 +1966,26 @@ async function sendScanPage(chatId) {
   await sendOrUpdate(chatId, text, { reply_markup: kb });
 }
 
-// ============ MESSAGE HANDLER ============
-bot.on('message', async (msg) => {
-  try {
-    if (msg.text && msg.text.startsWith('/')) return;
-    if (!msg.text && !msg.photo && !msg.video && !msg.document) return;
-    const chatId = msg.chat.id;
-    if (!global.botId) { try { global.botId = (await bot.getMe()).id; } catch (e) {} }
-    if (msg.from && msg.from.id === global.botId) return;
-
-    const [lang, stateRaw] = await Promise.all([getLang(chatId), getDB(`users/${chatId}/state`)]);
-    const state = stateRaw || 'IDLE';
-    const text = (msg.text || msg.caption || '').trim();
-
-    // İstifadəçinin daxil etdiyi mətn/kod/şəkil mesajı çatdan silinir -> menyu altında yığılma olmur
-    if (/^AWAITING_(LICENSE|PHONE|OTP|GROUP|CUSTOM_SOURCE|INTERVAL|CHANGE_INTERVAL|AUTO_REPLY|LIB_NAME|LIB_CONTENT)$/.test(state)) {
-      bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-    }
-
-    if (text === t('cancel_btn', lang)) {
-      delete userSessions[chatId];
-      await setDB(`users/${chatId}/state`, 'IDLE');
-      await showMainMenu(chatId);
-      return;
-    }
-
-    if (state === 'AWAITING_LICENSE') {
-      if (!text.startsWith('ELITE-')) { await sendOrUpdate(chatId, t('invalid_lic', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      const lic = await getDB(`licenses/${text}`);
-      if (!lic) { await sendOrUpdate(chatId, t('not_found_lic', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      if (!isLicenseCurrentlyValid(lic)) { await sendOrUpdate(chatId, t('blocked_lic', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      if (lic.usedBy && lic.usedBy !== chatId) { await sendOrUpdate(chatId, t('used_lic', lang), { reply_markup: { inline_keyboard: [[{ text: t('back_main', lang), callback_data: 'back_to_main' }]] } }); return; }
-      if (!lic.usedBy) await setDB(`licenses/${text}/usedBy`, chatId);
-      const hasExpiry = lic.expireTimestamp || lic.expiresAt || lic.expireDate;
-      if (!hasExpiry && lic.durationDays) {
-        await setDB(`licenses/${text}/expireTimestamp`, Date.now() + (parseInt(lic.durationDays) * 86400000));
-      }
-      await setDB(`users/${chatId}/activeLicense`, text);
-      await saveUserProfile(chatId, msg.from);
-      await syncLicenseUserInfo(chatId, text, msg.from);
-      delete gl
+// ============ NÖMRƏ TƏSDİQİ (OTP) ============
+function normalizePhone(raw) { return String(raw || '').trim().replace(/[\s\-()]/g, ''); }
+function tgErrCode(e) { return String((e && (e.errorMessage || e.message)) || e || '').toUpperCase(); }
+function friendlyAuthError(e) {
+  const m = tgErrCode(e);
+  if (/PHONE_NUMBER_INVALID/.test(m)) return '❌ Nömrə yanlışdır. Ölkə kodu ilə yazın (məs: +994501234567).';
+  if (/PHONE_NUMBER_BANNED/.test(m)) return '❌ Bu nömrə Telegram tərəfindən bloklanıb.';
+  if (/PHONE_NUMBER_FLOOD|FLOOD/.test(m)) {
+    const sec = (m.match(/(\d+)/) || [])[1];
+    return '⏳ Çox cəhd edildi. ' + (sec ? `${Math.ceil(sec / 60)} dəqiqə` : 'Bir az') + ' sonra yenidən cəhd edin.';
+  }
+  if (/PHONE_CODE_INVALID/.test(m)) return '❌ Kod səhvdir. Yenidən yazın və ya "Kodu yenidən göndər" basın.';
+  if (/PHONE_CODE_EXPIRED/.test(m)) return '⌛ Kodun vaxtı bitib. "Kodu yenidən göndər" düyməsini basın.';
+  if (/SEND_CODE_UNAVAILABLE/.test(m)) return '⚠️ Başqa göndərmə üsulu qalmayıb. 1-2 dəqiqə gözləyib yenidən cəhd edin.';
+  if (/PASSWORD_HASH_INVALID/.test(m)) return '❌ Parol səhvdir. Yenidən yazın.';
+  return null;
+}
+function otpWhereText(sentType, viaApp) {
+  const cn = String(sentType || '');
+  if (viaApp || /App/.test(cn)) return '📲 Kod Telegram tətbiqinə göndərildi: bu nömrənin açıq olduğu Telegram-da "Telegram" (rəsmi, 777000) söhbətinə baxın. (iPhone-da kod həmişə tətbiqə gəlir.)';
+  if (/Sms/.test(cn)) return '💬 Kod SMS ilə göndərildi.';
+  if (/Call|Flash/.test(cn)) return '📞 Kod zəng ilə veriləcək.';
+  return '📩 Kod göndərildi: Telegram tətbiqində "Tel
